@@ -434,10 +434,7 @@ def load_pkusaferlhf_queries(
 
 def load_safeedit_queries(
     model_alias: str,
-    return_only_prompts: bool=False,
     apply_chat_format: bool=False,
-    label: Literal["refusal", "error", "correct", "other"]=None,
-    split: Literal["train", "validation", "test"]="train",
 ):
     if '/' in model_alias:
         model_alias = model_alias.split('/')[-1]
@@ -446,23 +443,23 @@ def load_safeedit_queries(
     dataset = load_dataset("zjunlp/SafeEdit")['train']
     
     if apply_chat_format:
-        if model_alias == "gemma-2b-it" or model_alias == "gemma-7b-it" or model_alias == "gemma-2-9b-it" or model_alias == "gemma-2-2b-it":
+        if "gemma" in model_alias:
             from utils.hf_models.gemma_model import format_instruction_gemma_chat 
             format_instructions_chat_fn = partial(format_instruction_gemma_chat, system=None, include_trailing_whitespace=True)
-        elif model_alias == "Meta-Llama-3-8B-Instruct" or model_alias == "Meta-Llama-3-70B-Instruct":
+        elif "Llama-3" in model_alias:
             from utils.hf_models.llama3_model import format_instruction_llama3_chat
             format_instructions_chat_fn = partial(format_instruction_llama3_chat, system=None, include_trailing_whitespace=True)
         else:
             raise ValueError(f"Invalid model alias: {model_alias}")
-        
+    
     queries = []
     for _d in dataset:
         queries.append({"prompt": _d["adversarial prompt"], "response": _d["safe generation"], "label": True})
         queries.append({"prompt": _d["adversarial prompt"], "response": _d["unsafe generation"], "label": False})
 
     if apply_chat_format:
-        for q in queries:
-            q['prompt'] = format_instructions_chat_fn(instruction=q['prompt'])
+        for q in tqdm(queries, desc="应用聊天模板"):
+            q['prompt'] = format_instructions_chat_fn(instruction=q['prompt'],output=q['response'])
     return queries
 
 def load_safeedit_test_data(model_alias: str, apply_chat_format: bool=False):
