@@ -137,17 +137,3 @@ class GemmaModel(ModelBase):
     def _get_act_add_mod_fn(self, direction: Float[Tensor, "d_model"], coeff, layer):
         return functools.partial(act_add_gemma_weights, direction=direction, coeff=coeff, layer=layer)
     
-    def get_modules(self, hook_point: str, layers: List[int]):
-
-        modules_with_type = []
-        for l in layers:
-            transformer_block = self.model.model.layers[l]
-            if hook_point in ['block_input', 'pre_attn']:
-                modules_with_type.append((transformer_block.self_attn, 'pre'))
-            elif hook_point in ['post_attn', 'pre_mlp']:
-                modules_with_type.append((transformer_block.mlp, 'pre'))
-            elif hook_point in ['block_output', 'post_mlp']:
-                modules_with_type.append((transformer_block, 'post'))
-            else:
-                raise ValueError(f"不支持的钩子点: {hook_point}")
-        return modules_with_type

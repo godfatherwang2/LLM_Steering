@@ -466,7 +466,6 @@ def load_safeedit_test_data(model_alias: str, apply_chat_format: bool=False):
     from datasets import load_dataset
     dataset = load_dataset("zjunlp/SafeEdit")['test']
     queries = []
-    
     if apply_chat_format:
         if model_alias == "gemma-2b-it" or model_alias == "gemma-7b-it" or model_alias == "gemma-2-9b-it" or model_alias == "gemma-2-2b-it":
             from utils.hf_models.gemma_model import format_instruction_gemma_chat 

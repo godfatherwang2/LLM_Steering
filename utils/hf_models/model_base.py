@@ -146,7 +146,6 @@ class ModelBase(ABC):
                         steering_positions[batch_idx].extend([pos_slice.stop-1])
                     else:
                         steering_positions[batch_idx].extend(list(range(pos_slice.start, pos_slice.stop)))
-
                 # remove duplicate indexes
                 steering_positions[batch_idx] = list(set(steering_positions[batch_idx]))
 
@@ -156,7 +155,7 @@ class ModelBase(ABC):
                     attention_mask=attention_mask.to(self.model.device),
                     generation_config=generation_config,
                 )
-
+            
                 generation_toks = generation_toks[:, input_ids.shape[-1]:]
 
                 for generation_idx, generation in enumerate(generation_toks):
