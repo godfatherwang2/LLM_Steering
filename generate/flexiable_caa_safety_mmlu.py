@@ -1,5 +1,6 @@
-import os
 import sys
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 sys.path.append('./')
 sys.path.append('../')
 import torch
@@ -14,10 +15,34 @@ from utils.hf_patching_utils import add_hooks
 from utils.hf_models.model_base import ModelBase
 from utils.utils import model_alias_to_model_name
 from utils.hf_models.gemma_model import format_instruction_gemma_chat
-from dataset.load_data import load_safeedit_test_data, load_gsm_test_data, load_samsum_test_data,load_strongreject_test_data,load_beavertails_test_data
+from dataset.load_data import MMLUDataset
 import json
 import os
 from transformers import StoppingCriteria
+
+def get_few_shot_example():
+    """
+    返回一个few-shot示例，示意模型直接生成选项答案
+    """
+    return """Question: What is the capital of France?
+
+A) London
+B) Paris
+C) Berlin
+D) Madrid
+
+Answer: B
+
+Question: Which planet is closest to the Sun?
+
+A) Venus
+B) Earth
+C) Mercury
+D) Mars
+
+Answer: C
+
+"""
 
 class KeyWordsCriteria(StoppingCriteria):
     def __init__(self, stop_id_sequences):
@@ -35,12 +60,11 @@ class KeyWordsCriteria(StoppingCriteria):
             sequences_should_be_stopped.append(sequence_should_be_stopped)
         return all(sequences_should_be_stopped)
 
-
 class ActivationSteeringHook:
     """
     一个有状态的钩子管理器，用于在模型生成时进行实时激活值操控。
     """
-    def __init__(self, safe_index_path: str, unsafe_index_path: str, top_k: int = 10, multiplier: float = 1.0, steer_token_limit: int = 5, data_path_info: tuple = None, norm_magnitude: bool = False, caa_vectors_dir: str = "results/caa_vectors", model_alias: str = None, dataset_name: str = None, layer: int = None, selective_steering: bool = False):
+    def __init__(self, safe_index_path: str, unsafe_index_path: str, top_k: int = 10, multiplier: float = 1.0, steer_token_limit: int = 5, data_path_info: tuple = None, norm_magnitude: bool = False, caa_vectors_dir: str = "results/caa_vectors", model_alias: str = None, dataset_name: str = None, layer: int = None):
         """
         初始化激活值操控钩子。
 
@@ -61,7 +85,6 @@ class ActivationSteeringHook:
         self.multiplier = multiplier
         self.steer_token_limit = steer_token_limit
         self.norm_magnitude = norm_magnitude
-        self.selective_steering = selective_steering
         
         # 如果启用norm_magnitude，加载CAA向量
         if self.norm_magnitude:
@@ -125,8 +148,6 @@ class ActivationSteeringHook:
         safe_dists, safe_indices = self.safe_index.search(query_vector, self.top_k)
         unsafe_dists, unsafe_indices = self.unsafe_index.search(query_vector, self.top_k)
         # c. 使用正确的索引重构向量
-        #safe_vectors = torch.from_numpy(self.safe_index.reconstruct_batch(safe_indices[0])).to(activation.device, dtype=activation.dtype)
-        #unsafe_vectors = torch.from_numpy(self.unsafe_index.reconstruct_batch(unsafe_indices[0])).to(activation.device, dtype=activation.dtype)
         safe_vectors = torch.from_numpy(self.safe_array[safe_indices[0]]).to(activation.device, dtype=activation.dtype)
         unsafe_vectors = torch.from_numpy(self.unsafe_array[unsafe_indices[0]]).to(activation.device, dtype=activation.dtype)
 
@@ -138,16 +159,6 @@ class ActivationSteeringHook:
         unsafe_weights = torch.softmax(-unsafe_dists_accurate, dim=-1)
         avg_safe_vector = (safe_weights.unsqueeze(0) @ safe_vectors).squeeze(0)
         avg_unsafe_vector = (unsafe_weights.unsqueeze(0) @ unsafe_vectors).squeeze(0)
-        
-        # 选择性引导：只对距离安全隐藏状态大于非安全隐藏状态的token进行steer
-        if self.selective_steering:
-            # 计算当前激活值与加权平均安全/非安全向量的距离
-            safe_distance = torch.linalg.norm(activation - avg_safe_vector)
-            unsafe_distance = torch.linalg.norm(activation - avg_unsafe_vector)
-            
-            # 如果当前激活值距离非安全向量更近，则不进行引导
-            if unsafe_distance <= safe_distance:
-                return torch.zeros_like(activation)
         
         # e. 计算引导向量
         steer_vector =  (avg_safe_vector - avg_unsafe_vector)
@@ -171,6 +182,7 @@ class ActivationSteeringHook:
                 hidden_states = output_tuple[0]
             else:
                 hidden_states = output_tuple
+            
             # 检查是否还在引导限制内
             if self.generation_step < self.steer_token_limit:
                 # 获取最后一个token的激活值
@@ -187,50 +199,159 @@ class ActivationSteeringHook:
                 return hidden_states
         return hook_fn
 
-@torch.no_grad()
-def steered_generate(
+def get_pred(logits, answer_tokens_idx):
+    """
+    从logits中获取预测结果
+    Args:
+        logits: 模型输出的logits
+        answer_tokens_idx: 答案token的索引字典
+    Returns:
+        list: 每个选项的预测分数
+    """
+    predictions = []
+    for answer, token_ids in answer_tokens_idx.items():
+        # 计算每个选项的平均logit分数
+        scores = [logits[token_id] for token_id in token_ids]
+        avg_score = np.mean(scores)
+        predictions.append((answer, avg_score))
+    return predictions
+
+def batch_infer(
     model_base: ModelBase,
-    steering_hook: ActivationSteeringHook,
-    prompt: str,
-    layer_to_steer: int,
-    hook_point: str,
-    max_new_tokens: int = 50,
-    test_dataset: str = "safeedit",
+    prompts: List[str],
+    batch_size: int = 4,
+    max_new_tokens: int = 1,
+    return_score: bool = False,
+    fwd_pre_hooks: List = [],
+    fwd_hooks: List = [],
 ):
     """
-    使用激活值操控钩子来生成文本。
+    使用ModelBase结构进行批量推理
+    
+    Args:
+        model_base: ModelBase实例
+        prompts: 输入prompt列表
+        batch_size: 批处理大小
+        max_new_tokens: 最大生成token数
+        return_score: 是否返回logits分数
+        fwd_pre_hooks: 前向预钩子列表
+        fwd_hooks: 前向钩子列表
+    
+    Returns:
+        list: 推理结果列表
     """
-    tokenizer = model_base.tokenizer
-    model = model_base.model
+    answers = []
+    
+    for i in tqdm(range(0, len(prompts), batch_size), desc="Batch inference"):
+        batch_prompts = prompts[i:i+batch_size]
+        
+        # 使用ModelBase的tokenize_instructions_fn进行tokenization
+        tokenized_inputs = model_base.tokenize_instructions_fn(instructions=batch_prompts)
+        
+        # 将输入移动到模型设备
+        input_ids = tokenized_inputs.input_ids.to(model_base.model.device)
+        attention_mask = tokenized_inputs.attention_mask.to(model_base.model.device)
+        
+        with add_hooks(module_forward_pre_hooks=fwd_pre_hooks, module_forward_hooks=fwd_hooks):
+            with torch.no_grad():
+                if return_score:
+                    # 获取logits用于分数计算
+                    model_base.model.config.return_dict_in_generate = True
+                    outputs = model_base.model.generate(
+                        do_sample=False,
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        return_dict=True,
+                        output_scores=True,
+                        max_new_tokens=1,
+                    )
+                    
+                    # 获取最后一个位置的logits
+                    last_logits = outputs.scores[0]  # [batch_size, vocab_size]
+                    
+                    for j in range(len(batch_prompts)):
+                        answers.append({
+                            "score": last_logits[j].cpu().detach().numpy()
+                        })
+                else:
+                    # 生成文本
+                    generation_config = {
+                        "max_new_tokens": max_new_tokens,
+                        "do_sample": False,
+                        "pad_token_id": model_base.tokenizer.eos_token_id,
+                    }
+                    
+                    outputs = model_base.model.generate(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        **generation_config,
+                        return_dict_in_generate=True,
+                        output_scores=True,
+                    )
+                    
+                    # 提取生成的token
+                    input_length = input_ids.shape[1]
+                    generated_tokens = outputs.sequences[:, input_length:]
+                    
+                    # 解码生成的文本
+                    generated_texts = model_base.tokenizer.batch_decode(
+                        generated_tokens, skip_special_tokens=True
+                    )
+                    
+                    answers.extend(generated_texts)
+        torch.cuda.empty_cache()
+    return answers
 
-    # 1. 使用您的 get_modules 方法获取要挂钩的模块
-    target_module = model_base.model_block_modules[layer_to_steer]
-    # 2. 重置钩子状态并准备输入
-    inputs = tokenizer(prompt, return_tensors="pt")
-    steering_hook.reset_state()
-    # 3. 添加钩子并执行生成
-    hook_fn = steering_hook.create_hook_fn()
-
-    with add_hooks(module_forward_pre_hooks=[], module_forward_hooks=[(target_module,hook_fn)]):
-        if test_dataset == "GSM":
-            stop_id_sequences = [tokenizer.encode("Question:", add_special_tokens=False)]
-            stopping_criteria = [KeyWordsCriteria(stop_id_sequences)]
-            outputs = model.generate(
-                inputs.input_ids.to(model.device),
-                max_new_tokens=max_new_tokens,
-                stopping_criteria=stopping_criteria,
-                do_sample=False,
-                pad_token_id=tokenizer.eos_token_id,
-            )
+@torch.no_grad()
+def mmlu_evaluate(
+    model_base: ModelBase,
+    mmlu_dataset: MMLUDataset,
+    steering_hook: ActivationSteeringHook,
+    layer_to_steer: int,
+    batch_size: int = 16,
+    max_new_tokens: int = 1,
+):
+    """
+    在MMLU数据集上评估模型性能
+    """
+    print("加载MMLU测试数据...")
+    mmlu_test = mmlu_dataset.get_test_data()
+    
+    print("构建prompt列表...")
+    prompt_tokens_list = []
+    
+    few_shot_example = get_few_shot_example()
+    system_prompt = "The following are some multiple choice questions. Please answer with **only the letter of the correct option**.\n\n"
+    
+    for i in tqdm(range(len(mmlu_test)), desc="Processing prompts"):
+        ques = mmlu_test[i]["prompt"]
+        if args.model_alias == "gemma-2-9b-it":
+            # 构建完整的提示词：系统提示 + few-shot示例 + 实际问题
+            full_prompt = f"{few_shot_example}{ques}"
+            ques = f"<start_of_turn>user\n{system_prompt}<end_of_turn>\n<start_of_turn>model\n{full_prompt}"
+                prompt_tokens_list.append(ques)
         else:
-            outputs = model.generate(
-                inputs.input_ids.to(model.device),
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-                pad_token_id=tokenizer.eos_token_id,
-            )
-    return tokenizer.decode(outputs[0], skip_special_tokens=False)
+            raise NotImplementedError("Only gemma-2-9b-it is supported for now")
 
+    print("开始批量推理...")
+    
+    # 获取要挂钩的模块
+    target_module = model_base.model_block_modules[layer_to_steer]
+    hook_fn = steering_hook.create_hook_fn()
+    
+    mmlu_preds = batch_infer(
+        model_base=model_base,
+        prompts=prompt_tokens_list,
+        batch_size=batch_size,
+        max_new_tokens=max_new_tokens,
+        return_score=True,
+        fwd_hooks=[(target_module, hook_fn)],
+    )
+
+    print("计算准确率...")
+    mmlu_acc = mmlu_dataset.get_accuracy(mmlu_preds, tokenizer=model_base.tokenizer)
+    
+    return mmlu_acc, mmlu_preds
 
 def main(args):
     print("加载模型...")
@@ -240,7 +361,6 @@ def main(args):
     base_cache_dir = "dataset/cached_activations"
     safe_index_path = os.path.join(base_cache_dir,args.model_alias+"_"+args.dataset,"label_safe_shard_size_"+str(args.shared_size),f"faiss_index_layer_{args.layer}.index")
     unsafe_index_path = os.path.join(base_cache_dir,args.model_alias+"_"+args.dataset,"label_unsafe_shard_size_"+str(args.shared_size),f"faiss_index_layer_{args.layer}.index")
-
 
     cached_safe = os.path.join(base_cache_dir,args.model_alias+"_"+args.dataset,"label_safe_shard_size_"+str(args.shared_size),f"acts_{args.layer}.dat")
     cached_unsafe = os.path.join(base_cache_dir,args.model_alias+"_"+args.dataset,"label_unsafe_shard_size_"+str(args.shared_size),f"acts_{args.layer}.dat")
@@ -261,61 +381,52 @@ def main(args):
         caa_vectors_dir="results/caa_vectors",
         model_alias=args.model_alias,
         dataset_name=args.dataset,
-        layer=args.layer,
-        selective_steering=args.selective_steering
+        layer=args.layer
     )
     
-    if args.test_dataset == "safeedit":
-        queries = load_safeedit_test_data(model_alias=args.model_alias, apply_chat_format=True)
-    elif args.test_dataset == "StrongREJECT":
-        queries = load_strongreject_test_data(model_alias=args.model_alias, apply_chat_format=True)
-    elif args.test_dataset == "BeaverTails":
-        queries = load_beavertails_test_data(model_alias=args.model_alias, apply_chat_format=True)
-    elif args.test_dataset == "GSM":
-        queries = load_gsm_test_data(model_alias=args.model_alias, apply_chat_format=True)
-        if args.model_alias == "gemma-2-9b-it":
-            args.max_new_tokens = 1024
-        else:
-            args.max_new_tokens = 512
-    elif args.test_dataset == "samsum":
-        queries = load_samsum_test_data(model_alias=args.model_alias, apply_chat_format=True)
-    else:
-        raise ValueError(f"Invalid test dataset: {args.test_dataset}")
-
-    questions = []
-    generations = []
-    gt_answers = []
+    print("初始化MMLU数据集...")
+    mmlu_dataset = MMLUDataset(data_dir=args.data_dir)
     
-    for query in tqdm(queries, desc="Generating outputs"):
-        steered_output = steered_generate(
-            model_base,
-            steering_hook,
-            query['prompt'],
-            layer_to_steer=args.layer,
-            hook_point=args.hook_point,
-            max_new_tokens=args.max_new_tokens,
-            test_dataset=args.test_dataset
-        )
-        pure_output = steered_output.split("<end_of_turn>\n<start_of_turn>model\n")[1] if "<end_of_turn>\n<start_of_turn>model\n" in steered_output else steered_output
-        generations.append(pure_output)
-        questions.append(query['prompt'].replace("<end_of_turn>\n<start_of_turn>model\n", "").replace("<start_of_turn>user\n", ""))
-        if args.test_dataset == "GSM" or args.test_dataset == "samsum":
-            gt_answers.append(query['answer'])
-
-    if args.test_dataset == "GSM" or args.test_dataset == "samsum":
-        final_data = [{'question': q, 'generation': g, 'answer': a} for q, g, a in zip(questions, generations, gt_answers)]
-    else:
-        final_data = [{'question': q, 'generation': g} for q, g in zip(questions, generations)]
-    # 在路径中添加top_k、norm_magnitude和selective_steering信息
+    print("开始MMLU评测...")
+    mmlu_acc, mmlu_preds = mmlu_evaluate(
+        model_base=model_base,
+        mmlu_dataset=mmlu_dataset,
+        steering_hook=steering_hook,
+        layer_to_steer=args.layer,
+        batch_size=args.batch_size,
+        max_new_tokens=args.max_new_tokens,
+    )
+    
+    print(f"MMLU准确率: {mmlu_acc:.4f}")
+    
+    # 保存结果
+    results = {
+        "mmlu_accuracy": mmlu_acc,
+        "model_alias": args.model_alias,
+        "dataset": args.dataset,
+        "shared_size": args.shared_size,
+        "layer": args.layer,
+        "hook_point": args.hook_point,
+        "top_k": args.top_k,
+        "multiplier": args.multiplier,
+        "norm_magnitude": args.norm_magnitude,
+        "batch_size": args.batch_size,
+        "max_new_tokens": args.max_new_tokens,
+    }
+    
+    # 在路径中添加top_k和norm_magnitude信息
     norm_info = "norm" if args.norm_magnitude else "no_norm"
-    selective_info = "selective" if args.selective_steering else "all"
-    rst_dir = f"results/generations/{args.model_alias}/{args.test_dataset}/flexible_caa/topk_{args.top_k}_{norm_info}_{selective_info}"   
+    rst_dir = f"results/generations/{args.model_alias}/mmlu/safeedit/flexible_caa/topk_{args.top_k}_{norm_info}/"
     os.makedirs(rst_dir, exist_ok=True)
-    with open(os.path.join(rst_dir, f"{args.dataset}_{args.layer}.json"), "w") as f:
-        json.dump(final_data, f,indent=2)
+    
+    output_filename = f"{args.dataset}_{args.layer}.json"
+    with open(os.path.join(rst_dir, output_filename), "w") as f:
+        json.dump(results, f, indent=2)
+    
+    print(f"结果已保存到: {os.path.join(rst_dir, output_filename)}")
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='使用激活值操控进行引导式生成')
+    parser = argparse.ArgumentParser(description='使用激活值操控进行MMLU评测')
     parser.add_argument('--model_alias', type=str, default="gemma-2-9b-it", help='模型别名')
     parser.add_argument('--dataset', type=str, default="safeedit", help='Dataset name used for caching')
     parser.add_argument('--shared_size', type=int, default=4050)
@@ -323,9 +434,10 @@ if __name__ == '__main__':
     parser.add_argument('--hook_point', type=str, default='block_output', help='用于引导的激活值来源')
     parser.add_argument('--top_k', type=int, default=10, help='FAISS检索的近邻数量')
     parser.add_argument('--multiplier', type=float, default=1.0, help='引导向量的强度系数')
-    parser.add_argument('--test_dataset', type=str, default="GSM")
-    parser.add_argument('--max_new_tokens', type=str, default=50)
+    parser.add_argument('--data_dir', type=str, default="/home/wangxin/projects/steer-target-atoms-main/data/mmlu", help='MMLU数据集路径')
+    parser.add_argument('--batch_size', type=int, default=1, help='批处理大小')
+    parser.add_argument('--max_new_tokens', type=int, default=1, help='最大生成token数')
     parser.add_argument('--norm_magnitude', action='store_true', default=False, help='是否将steer_vector缩放到与CAA向量相同的范数')
-    parser.add_argument('--selective_steering', action='store_true', default=False, help='只对距离安全隐藏状态大于非安全隐藏状态的token进行steer')
+    parser.add_argument('--qa',type=bool, default=True, help='是否使用QA格式')
     args = parser.parse_args()
-    main(args)
+    main(args) 

@@ -1,5 +1,4 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 import sys
 sys.path.append('./')
 sys.path.append('../')
@@ -34,16 +33,19 @@ random.seed(10)
 
 DEFAULT_CACHE_DIR = os.path.join("dataset/cached_activations")
 
-def _get_activations_pre_hook(cache: Float[Tensor, "pos d_model"]):
-    def hook_fn(module, input):
+def _get_activations_forward_hook(cache: Float[Tensor, "pos d_model"]):
+    def hook_fn(module, input_tuple, output_tuple):
         nonlocal cache
-        activation: Float[Tensor, "batch_size seq_len d_model"] = input[0].clone().to(cache)
-        cache[:, :] += activation[:, :].to(cache)
+        if isinstance(output_tuple, tuple):
+            activation: Float[Tensor, "batch_size seq_len d_model"] = output_tuple[0]
+        else:
+            activation: Float[Tensor, "batch_size seq_len d_model"] = output_tuple
+        cache[:, :] = activation[:, :].to(cache)
     return hook_fn
 
 
 @torch.no_grad()
-def _get_activations_fixed_seq_len(model, tokenizer, prompts: List[str], block_modules: List[torch.nn.Module], seq_len: int = 512, layers: List[int]=None, batch_size=32, save_device: Union[torch.device, str] = "cuda", verbose=True) -> Tuple[Float[Tensor, 'n seq_len'], Float[Tensor, 'n layer seq_len d_model']]:
+def _get_activations_fixed_seq_len(model, tokenizer, prompts: List[str], block_modules: List[torch.nn.Module], seq_len: int = 512, layers: List[int]=None, batch_size=32, save_device: Union[torch.device, str] = "cuda", verbose=True) -> Tuple[Int[Tensor, 'n seq_len'], Float[Tensor, 'n layer seq_len d_model']]:
     torch.cuda.empty_cache()
 
     if layers is None:
@@ -67,13 +69,13 @@ def _get_activations_fixed_seq_len(model, tokenizer, prompts: List[str], block_m
 
         inputs_len = len(input_ids)
         num_input_toks = input_ids.shape[-1]
-
-        fwd_pre_hooks = [
-            (block_modules[layer], _get_activations_pre_hook(cache=activations[i:i+inputs_len, layer_idx, :num_input_toks, :])) 
+        
+        fwd_hooks = [
+            (block_modules[layer], _get_activations_forward_hook(cache=activations[i:i+inputs_len, layer_idx, :num_input_toks, :])) 
             for layer_idx, layer in enumerate(layers)
         ]
 
-        with add_hooks(module_forward_pre_hooks=fwd_pre_hooks, module_forward_hooks=[]):
+        with add_hooks(module_forward_pre_hooks=[], module_forward_hooks=fwd_hooks):
             model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -131,7 +133,6 @@ def cache_activations(model_base: ModelBase, prompts: List[str], compute_activat
         layers = list(range(n_layers)) # 确保 layers 是一个列表
     else:
         n_layers = len(layers)
-
     # === 第一阶段：预计算 total_tokens (此部分代码完全不变) ===
     total_tokens = 0
     valid_prompts = []
@@ -160,7 +161,7 @@ def cache_activations(model_base: ModelBase, prompts: List[str], compute_activat
             valid_start_pos.append(start_pos)
             valid_lens.append(valid_length)
             valid_ids.append(inputs.input_ids[0][start_pos:start_pos+valid_length])
-
+    
     print(f"Total tokens to be cached: {total_tokens}")
 
     # === 新功能: 创建元数据文件 ===
@@ -257,7 +258,7 @@ def load_pkusaferlhf_instructions_to_cache(model_alias: str, tokens_to_cache: st
 
 def load_safeedit_instructions_to_cache(model_alias: str, tokens_to_cache: str, entity_type: str = None, balance_data: bool = True):
     from dataset.load_data import load_safeedit_queries
-    queries = load_safeedit_queries(model_alias=model_alias,apply_chat_format=True)[:10]
+    queries = load_safeedit_queries(model_alias=model_alias,apply_chat_format=True)
     substrings = [tokens_to_cache for query in queries]
     prompts = ([query["prompt"] for query in queries if query['label']==True], [query["prompt"] for query in queries if query['label']==False])
     substrings = (substrings[:len(prompts[0])], substrings[len(prompts[0]):])
@@ -332,7 +333,7 @@ if __name__ == '__main__':
     parser.add_argument('--model_alias', type=str, default="gemma-2-9b-it", help='Alias of the model to use')
     parser.add_argument('--tokens_to_cache', type=str, default="<start_of_turn>model\n", help='How to find the position to cache. Options: "response", "entity", "last_eoi", "?", "random"')
     parser.add_argument('--batch_size', type=int, default=16, help='Batch size for processing')
-    parser.add_argument('--layers', type=str, default="24", help='layers to collect activations')
+    parser.add_argument('--layers', type=str, default="20", help='layers to collect activations')
     parser.add_argument('--dataset', type=str, default="safeedit", help='Dataset to use. Options: "PKU-SafeRLHF", "wikidata", "triviaqa", "pile"')
     args = parser.parse_args()
     main(args)

@@ -1,3 +1,5 @@
+import sys
+sys.path.append("/home/wangxin/projects/safety_steer")
 import os
 import json
 import pandas as pd
@@ -14,14 +16,26 @@ from functools import partial
 from datasets import Dataset
 import re
 from sklearn.model_selection import train_test_split
-
+import datasets
 from utils.generation_utils import is_generation_refusal
+from datasets import load_dataset
+import numpy as np
 
 entities_dataset_dir_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "processed", "entity_prompts")
 triviaqa_dataset_dir_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "processed", "triviaqa")
 keen_dataset_dir_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "processed", "keen")
 mmlu_dataset_dir_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "processed", "mmlu")
 keen_raw_data_dir_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "raw", "keen")
+
+
+MMLU_CASE_PROMPT = """Question: {question}
+
+A) {choice_a}
+B) {choice_b}
+C) {choice_c}
+D) {choice_d}
+
+Answer: """
 
 PROMPT_TYPES_BY_ENTITY = {
     "book": ["book_is_known", "book_attribute_creator"],
@@ -462,9 +476,16 @@ def load_safeedit_queries(
             q['prompt'] = format_instructions_chat_fn(instruction=q['prompt'],output=q['response'])
     return queries
 
+def load_safeedit_for_sae_feature_selection(model_alias: str, apply_chat_format: bool=False):
+    dataset = load_dataset("zjunlp/SafeEdit")['train']
+    queries = []
+    for _d in dataset:
+        queries.append({"question": _d["adversarial prompt"], "not_matching": _d["unsafe generation"], "matching": _d["safe generation"]})
+    return queries
+
+
 def load_safeedit_test_data(model_alias: str, apply_chat_format: bool=False):
-    from datasets import load_dataset
-    dataset = load_dataset("zjunlp/SafeEdit")['test']
+    dataset = load_dataset("json",data_files="/home/wangxin/projects/safety_steer/dataset/SafeEdit/SafeEdit_test.json")['train']
     queries = []
     if apply_chat_format:
         if model_alias == "gemma-2b-it" or model_alias == "gemma-7b-it" or model_alias == "gemma-2-9b-it" or model_alias == "gemma-2-2b-it":
@@ -481,8 +502,128 @@ def load_safeedit_test_data(model_alias: str, apply_chat_format: bool=False):
     if apply_chat_format:
         for q in queries:
             q['prompt'] = format_instructions_chat_fn(instruction=q['prompt'])
+    return queries 
+
+def load_strongreject_test_data(model_alias: str, apply_chat_format: bool=False):
+    dataset = load_dataset("/home/wangxin/datas/walledai/StrongREJECT",split="train")
+    if apply_chat_format:
+        if model_alias == "gemma-2b-it" or model_alias == "gemma-7b-it" or model_alias == "gemma-2-9b-it" or model_alias == "gemma-2-2b-it":
+            from utils.hf_models.gemma_model import format_instruction_gemma_chat 
+            format_instructions_chat_fn = partial(format_instruction_gemma_chat, system=None, include_trailing_whitespace=True)
+        elif model_alias == "Meta-Llama-3-8B-Instruct" or model_alias == "Meta-Llama-3-70B-Instruct":
+            from utils.hf_models.llama3_model import format_instruction_llama3_chat
+            format_instructions_chat_fn = partial(format_instruction_llama3_chat, system=None, include_trailing_whitespace=True)
+        else:
+            raise ValueError(f"Invalid model alias: {model_alias}")
+
+    queries = []
+    for _d in dataset:
+        queries.append({"prompt": _d["prompt"]})
+    if apply_chat_format:
+        for q in queries:
+            q['prompt'] = format_instructions_chat_fn(instruction=q['prompt'])
     return queries
 
+
+def load_beavertails_test_data(model_alias: str, apply_chat_format: bool=False):
+    dataset = load_dataset("/home/wangxin/datas/PKU-Alignment/BeaverTails-Evaluation", split="test")
+    if apply_chat_format:
+        if model_alias == "gemma-2b-it" or model_alias == "gemma-7b-it" or model_alias == "gemma-2-9b-it" or model_alias == "gemma-2-2b-it":
+            from utils.hf_models.gemma_model import format_instruction_gemma_chat 
+            format_instructions_chat_fn = partial(format_instruction_gemma_chat, system=None, include_trailing_whitespace=True)
+        elif model_alias == "Meta-Llama-3-8B-Instruct" or model_alias == "Meta-Llama-3-70B-Instruct":
+            from utils.hf_models.llama3_model import format_instruction_llama3_chat
+            format_instructions_chat_fn = partial(format_instruction_llama3_chat, system=None, include_trailing_whitespace=True)
+        else:
+            raise ValueError(f"Invalid model alias: {model_alias}")
+
+    queries = []
+    for _d in dataset:
+        queries.append({"prompt": _d["prompt"]})
+    if apply_chat_format:
+        for q in queries:
+            q['prompt'] = format_instructions_chat_fn(instruction=q['prompt'])
+    return queries
+
+def load_gsm_test_data(
+        model_alias: str,
+        data_name="gsm",
+        data_path="/home/wangxin/projects/steer-target-atoms-main/data/safety",
+        apply_chat_format=False,
+    ):
+        data_file = os.path.join(
+            data_path,
+            data_name,
+            "test.jsonl",
+        )
+        dataset = load_dataset("json", data_files=data_file, split="train")
+        original_columns = dataset.column_names
+
+
+        if apply_chat_format:
+            if model_alias == "gemma-2b-it" or model_alias == "gemma-7b-it" or model_alias == "gemma-2-9b-it" or model_alias == "gemma-2-2b-it":
+                from utils.hf_models.gemma_model import format_instruction_gemma_chat 
+                format_instructions_chat_fn = partial(format_instruction_gemma_chat, system=None, include_trailing_whitespace=True)
+            elif model_alias == "Meta-Llama-3-8B-Instruct" or model_alias == "Meta-Llama-3-70B-Instruct":
+                from utils.hf_models.llama3_model import format_instruction_llama3_chat
+                format_instructions_chat_fn = partial(format_instruction_llama3_chat, system=None, include_trailing_whitespace=True)
+            else:
+                raise ValueError(f"Invalid model alias: {model_alias}")
+
+        def return_prompt_and_responses(samples) -> Dict[str, str]: 
+            prompts = []
+            answers = []
+            questions = []
+            for question in samples["question"]:
+                question = "Answer the following question.\n\n" + "Question: " + question.strip() + "\n\nPlease wrap the final answer in $\\boxed{{}}$ tag."
+                if apply_chat_format:
+                    question = format_instructions_chat_fn(instruction=question)
+                questions.append(question)
+            for answer in samples["answer"]:
+                answer = re.sub(r"(\d),(\d)", r"\1\2", answer.split("####")[1].strip())
+                assert float(answer), f"answer is not a valid number: {answer}"
+                answers.append(answer)
+            return {
+                "prompt": questions,
+                "answer": answers,
+            }
+
+        return dataset.map(
+            return_prompt_and_responses,
+            batched=True,
+            remove_columns=original_columns,
+        )
+
+def load_samsum_test_data(model_alias: str, apply_chat_format: bool=False):
+    system_prompt = "You are a helpful assistant for dialog summarization, your response should be **concise** and to the point."
+    dataset = load_dataset("/home/wangxin/datas/samsum",split="test")
+    original_columns = dataset.column_names
+    if apply_chat_format:
+        if model_alias == "gemma-2b-it" or model_alias == "gemma-7b-it" or model_alias == "gemma-2-9b-it" or model_alias == "gemma-2-2b-it":
+            from utils.hf_models.gemma_model import format_instruction_gemma_chat 
+            format_instructions_chat_fn = partial(format_instruction_gemma_chat, system=None, include_trailing_whitespace=True)
+        elif model_alias == "Meta-Llama-3-8B-Instruct" or model_alias == "Meta-Llama-3-70B-Instruct":
+            from utils.hf_models.llama3_model import format_instruction_llama3_chat
+            format_instructions_chat_fn = partial(format_instruction_llama3_chat, system=None, include_trailing_whitespace=True)
+        else:
+            raise ValueError(f"Invalid model alias: {model_alias}")
+    def return_prompt_and_responses(samples) -> Dict[str, str]: 
+        prompts = []
+        questions = []
+        for dialogue in samples['dialogue']:
+            prompt = system_prompt + f"Summarize this dialog:\n{dialogue}"
+            if apply_chat_format:
+                prompt = format_instructions_chat_fn(instruction=prompt)
+            prompts.append(prompt)
+        return {
+            "prompt": prompts, 
+            "answer": samples["summary"],
+        }
+    return dataset.map(
+        return_prompt_and_responses,
+        batched=True,
+        remove_columns=original_columns,
+    )
 
 def balance_data(queries: List[Dict], labels: List[int], shuffle=True):
     # Count the number of examples for each label
@@ -511,3 +652,115 @@ def balance_data(queries: List[Dict], labels: List[int], shuffle=True):
         random.shuffle(balanced_queries)
     
     return balanced_queries
+
+def get_pred(logits, answer_tokens_idx):
+
+    soft_max_prob = np.exp(logits) / np.sum(np.exp(logits))
+    pred = []
+
+    for answer, token_indices in answer_tokens_idx.items():
+        prob = float(soft_max_prob[token_indices].sum())
+        pred.append((answer, prob))
+
+    return pred
+
+class MMLUDataset:
+    """MMLU Dataset for the evaluation of steered model on
+
+    basically, it is a wrapper around the mmlu dataset,
+    the testing steps are as follows:
+    1. load the data from the mmlu dataset
+    2. generate the prompts and responses using the template
+    3. pass the prompts to the model for the prediction
+    4. evaluate the predictions
+
+    We use the devset from the cais/mmlu for zero-shot evaluation
+    https://huggingface.co/datasets/cais/mmlu
+
+    Args:
+        data_dir: str, path to the mmlu dataset
+    """
+    def __init__(self, data_dir="/home/wangxin/projects/steer-target-atoms-main/data/mmlu"):
+        self.data_dir = data_dir
+        self.dataset = load_dataset(self.data_dir, "all")["test"]  # cais/mmlu
+        # process answer to A,B,C,D
+        project_to_answer = {
+            0: "A",
+            1: "B", 
+            2: "C",
+            3: "D",
+        }
+        self.answers = self.dataset["answer"]
+        self.answers = [project_to_answer[i] for i in self.answers]
+
+    def get_test_data(self):
+        def return_prompt_and_responses(samples) -> Dict[str, str]:
+            prompts = []
+            for i in range(len(samples["question"])):
+                question = samples["question"][i]
+                choices = samples["choices"][i]
+                # 只返回格式化后的问题和选项，不包含系统提示和few-shot示例
+                prompt = MMLU_CASE_PROMPT.format(
+                    question=question,
+                    choice_a=choices[0],
+                    choice_b=choices[1], 
+                    choice_c=choices[2],
+                    choice_d=choices[3],
+                )
+                prompts.append(prompt)
+
+            return {
+                "prompt": prompts,
+                "choices": samples["choices"],
+            }
+
+        return self.dataset.map(
+            return_prompt_and_responses,
+            batched=True,
+            remove_columns=["subject", "answer"],
+        )
+
+    def get_accuracy(self, predictions, tokenizer):
+        """
+        Args:
+            predictions: list, list of predicted answers
+            tokenizer: transformers.PreTrainedTokenizer
+
+        Returns:
+            accuracy: float, accuracy of the predictions
+        """
+        assert len(predictions) == len(self.answers)
+
+        answer_tokens_idx = {
+            "A": [
+                tokenizer.encode(token, add_special_tokens=False)[0]
+                for token in ["a", "A"]
+            ],
+            "B": [
+                tokenizer.encode(token, add_special_tokens=False)[0]
+                for token in ["b", "B"]
+            ],
+            "C": [
+                tokenizer.encode(token, add_special_tokens=False)[0]
+                for token in ["c", "C"]
+            ],
+            "D": [
+                tokenizer.encode(token, add_special_tokens=False)[0]
+                for token in ["d", "D"]
+            ],
+        }
+        
+        acc = []
+
+        for i in range(len(predictions)):
+            logits = predictions[i]["score"]
+            ans = self.answers[i]
+            pred = get_pred(logits, answer_tokens_idx)
+            pred = max(pred, key=lambda x: x[1])[0]
+            acc.append(1) if pred == ans else acc.append(0)
+
+        return np.mean(acc)
+
+
+if __name__ == "__main__":
+    data = load_safeedit_test_data(model_alias="gemma-2-9b-it", apply_chat_format=True)

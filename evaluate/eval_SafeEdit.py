@@ -1,5 +1,3 @@
-import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 import pandas as pd
 from datetime import datetime
 import statistics
@@ -22,7 +20,7 @@ import scipy
 import nltk
 import glob
 import re
-
+import os
 
 def n_gram_entropy(gen_texts, agg="arith"):
     assert agg in ["arith", "geom"]
@@ -224,7 +222,7 @@ def evaluate_safeedit_results(pred_file, safety_classifier_dir, output_dir=None)
 
 def main():
     parser = argparse.ArgumentParser(description='评估SafeEdit生成结果的安全性和流畅性')
-    parser.add_argument('--pred_file', type=str, default='/home/wangxin/projects/safety_steer/results/generations/gemma-2-9b-it/safeedit/vanilla', 
+    parser.add_argument('--pred_file', type=str, default='/home/wangxin/projects/safety_steer/results/generations/gemma-2-9b-it/safeedit/flexible_sae_querylevel/safeedit_20', 
                        help='预测文件路径或包含.json文件的目录')
     parser.add_argument('--safety_classifier_dir', type=str,default='/home/wangxin/models/zjunlp/SafeEdit-Safety-Classifier', 
                        help='安全分类器模型目录路径')
